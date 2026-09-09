@@ -9,7 +9,7 @@ Three wirings of the same idea run side by side, so they can be compared:
 ```
                     ┌────────────────────────────────────────────────┐
   MCP client / LLM ▶│ LiteLLM proxy                 :4000  /mcp      │
-                    │  config-only: no database                      │
+                    │  UI + keys backed by Postgres                  │
                     │                                                │
                     │  path2: oracledb-mcp-server, spawned here      │
                     │         per call with uvx                      │
@@ -28,8 +28,8 @@ Three wirings of the same idea run side by side, so they can be compared:
                     └────────────────────────────────────────────────┘
 ```
 
-Four containers: the database, one per HTTP-served path, and the proxy (which
-hosts path2 itself). Every path queries as `BIR_RO`, so none of them can write.
+Five containers: Oracle, one per HTTP-served path, the proxy (which hosts path2
+itself) and the Postgres its UI needs. Every path queries as `BIR_RO`, so none of them can write.
 
 > **Note on the database version.** The request was Oracle 19c. There is no
 > ARM64 Oracle 19c container image, and this host is Apple Silicon — 19c would
@@ -44,7 +44,7 @@ hosts path2 itself). Every path queries as `BIR_RO`, so none of them can write.
 
 | Path | Purpose |
 | --- | --- |
-| `docker-compose.yml` | Services: `oracle`, `oracle-init`, `mcp-path1`, `mcp-path3`, `litellm` |
+| `docker-compose.yml` | Services: `oracle`, `oracle-init`, `mcp-path1`, `mcp-path3`, `litellm-db`, `litellm` |
 | `.env` | Ports, passwords, optional provider keys |
 | `oracle/sql/01_schema.sql` | Tables, indexes, views, `BIR` + `BIR_RO` users |
 | `oracle/sql/02_seed.sql` | One business day of deterministic seed data |
@@ -72,6 +72,7 @@ Ports (all configurable in `.env`):
 | --- | --- | --- |
 | Oracle | 1522 | `localhost:1522/FREEPDB1` |
 | LiteLLM | 4000 | `http://localhost:4000` (UI at `/ui`, MCP at `/mcp`) |
+| Postgres | — | internal only |
 | path1 | 9011 | `http://localhost:9011/mcp` (dmeppiel image, bridged) |
 | path3 | 9012 | `http://localhost:9012/mcp` (oracledb-mcp-server, bridged) |
 
@@ -173,7 +174,7 @@ Set in `.env`, created by `oracle/sql/01_schema.sql`:
 A logon trigger sets `CURRENT_SCHEMA = BIR` for `bir_ro`, so unqualified names
 in ad-hoc SQL resolve without a `BIR.` prefix. LiteLLM's own credential is
 `LITELLM_MASTER_KEY`; the UI at `/ui` takes `admin` plus that key as the
-password.
+password. `LITELLM_DB_PWD` is the Postgres password behind the UI.
 
 There is no `.env` in the repository. Copy `.env.example`, set your own values,
 and keep it out of version control:
@@ -208,31 +209,26 @@ SELECT account_no, ccy_code, amount, priority, queued_minutes, status
 SELECT severity, alert_type, account_no, message FROM v_open_alerts;
 ```
 
-## No database behind the proxy
+## The database behind the proxy
 
-LiteLLM runs from `config.yaml` alone - there is no Postgres in this stack.
-`general_settings` carries only the master key, and the MCP servers and models
-come from the file:
+LiteLLM keys, sessions and spend logs live in Postgres (`litellm-db`). The MCP
+servers themselves come from `config.yaml`, not the database, so the proxy will
+start and serve them with no database at all - but its **UI will not work**:
+every UI request goes through `user_api_key_auth`, which needs a database and
+otherwise fails with `No connected db`, leaving the MCP page empty even though
+the servers are registered and healthy.
 
-```yaml
-general_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
-```
-
-Verified with the database removed: `/health/liveliness` 200, `/ui/` 200,
-`/v1/mcp/server` 200 and all three paths return their tools.
-
-What a database would add, and what is therefore unavailable here:
-
-| Needs a DB | Works without one |
+| Needs Postgres | Works without it |
 | --- | --- |
-| Virtual keys, teams, budgets (`/key/generate` returns *"DB not connected"*) | The master key as the single credential |
-| Spend and request logs | Health endpoints, the MCP gateway, model routing |
+| The admin UI at `/ui`, including viewing the MCP servers | The MCP gateway at `/mcp` |
+| Virtual keys, teams, budgets (`/key/generate`) | `/v1/mcp/server`, `/v1/mcp/tools`, `/v1/mcp/server/health` |
+| Spend and request logs | Health endpoints and model routing |
 | Adding models or MCP servers through the UI | Everything declared in `config.yaml` |
 
-To put it back: run a Postgres service, set `DATABASE_URL` and
-`STORE_MODEL_IN_DB=True` on the proxy, and add `database_url` /
-`store_model_in_db` to `general_settings`.
+To run without it, drop the `litellm-db` service, remove `DATABASE_URL` and
+`STORE_MODEL_IN_DB` from the proxy, and delete `database_url` /
+`store_model_in_db` from `general_settings` - then drive the gateway over the
+API with the master key.
 
 ## Three ways to wire an MCP server
 

@@ -119,10 +119,30 @@ services:
     restart: unless-stopped
 
   # ------------------------------------------------------------------
-  # LiteLLM proxy / MCP gateway. No database: the MCP servers and models
-  # come from config.yaml, and the master key is the only credential. That
-  # rules out virtual keys, teams, budgets, spend logs and adding servers
-  # through the UI - none of which this PoC uses.
+  # LiteLLM backing store. The proxy runs without it, but its UI cannot:
+  # every UI request goes through user_api_key_auth, which needs a database
+  # and otherwise fails with "No connected db".
+  # ------------------------------------------------------------------
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: bir-litellm-db
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${LITELLM_DB_PWD}
+      POSTGRES_DB: litellm
+    volumes:
+      - litellm-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # LiteLLM proxy / MCP gateway. The MCP servers still come from
+  # config.yaml; Postgres is what backs the UI session, virtual keys and
+  # spend logs.
   # ------------------------------------------------------------------
   litellm:
     # Stock image. uv and the MCP server package are installed at container
@@ -131,6 +151,8 @@ services:
     image: ghcr.io/berriai/litellm:main-stable
     container_name: bir-litellm
     depends_on:
+      litellm-db:
+        condition: service_healthy
       mcp-path1:
         condition: service_healthy
       mcp-path3:
@@ -148,6 +170,8 @@ services:
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      DATABASE_URL: postgresql://litellm:${LITELLM_DB_PWD}@litellm-db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
       # Where `uv tool install` puts things, and where `uvx --offline` looks
       # for them when the proxy spawns the MCP server.
       # Consumed by the MCP server the proxy spawns over stdio (path2);
@@ -175,3 +199,4 @@ services:
 
 volumes:
   oracle-data:
+  litellm-db-data:
