@@ -1,0 +1,177 @@
+name: bir-poc
+
+services:
+  # ------------------------------------------------------------------
+  # Oracle Database 23ai Free (arm64 native image)
+  # ------------------------------------------------------------------
+  oracle:
+    image: container-registry.oracle.com/database/free:latest
+    container_name: bir-oracle
+    environment:
+      ORACLE_PWD: ${ORACLE_PWD}
+      ORACLE_CHARACTERSET: AL32UTF8
+      ENABLE_ARCHIVELOG: "false"
+    ports:
+      - "${ORACLE_PORT:-1522}:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 60
+      start_period: 180s
+    shm_size: 1g
+
+  # ------------------------------------------------------------------
+  # One-shot schema + seed loader (uses sqlplus from the Oracle image)
+  # ------------------------------------------------------------------
+  oracle-init:
+    image: container-registry.oracle.com/database/free:latest
+    container_name: bir-oracle-init
+    depends_on:
+      oracle:
+        condition: service_healthy
+    environment:
+      DB_HOST: oracle
+      DB_PORT: "1521"
+      DB_SERVICE: FREEPDB1
+      ORACLE_PWD: ${ORACLE_PWD}
+      BIR_PWD: ${BIR_PWD}
+      BIR_RO_PWD: ${BIR_RO_PWD}
+    volumes:
+      - ./oracle/sql:/opt/oracle/sql:ro
+      - ./oracle/setup:/opt/oracle/setup:ro
+    entrypoint: ["/bin/bash", "/opt/oracle/setup/init.sh"]
+    restart: "no"
+
+  # ------------------------------------------------------------------
+  # PATH 1 - published image (dmeppiel/oracle-mcp-server) in its own container
+  #
+  # That server speaks stdio only, so on its own a long-running container just
+  # idles on a stdin nobody writes to - there is no port for LiteLLM to reach.
+  # mcp-proxy (installed at start with the uv already in the image) fronts it
+  # with streamable HTTP on :8000, and LiteLLM connects to a URL like any other
+  # HTTP MCP server. `mcp<2` is pinned because mcp-proxy 0.12 imports
+  # request_ctx, which mcp 2.x moved.
+  # ------------------------------------------------------------------
+  mcp-path1:
+    image: dmeppiel/oracle-mcp-server
+    container_name: bir-mcp-path1
+    depends_on:
+      oracle-init:
+        condition: service_completed_successfully
+    command:
+      - sh
+      - -c
+      - |
+        # --pass-environment: mcp-proxy starts the child with a clean env otherwise
+        exec uvx --with "mcp<2" mcp-proxy --pass-environment --host 0.0.0.0 --port 8000 --stateless -- uv run main.py
+    environment:
+      ORACLE_CONNECTION_STRING: "bir_ro/${BIR_RO_PWD}@oracle:1521/FREEPDB1"
+      TARGET_SCHEMA: BIR
+      CACHE_DIR: /tmp/.cache
+      THICK_MODE: ""
+      READ_ONLY_MODE: "1"
+    ports:
+      - "${PATH1_PORT:-9011}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # PATH 3 - the package path 2 runs, but in its own container: a stock
+  # python image installs uv at start and mcp-proxy fronts the stdio server
+  # with streamable HTTP on :8000. No custom image, no custom code.
+  # ------------------------------------------------------------------
+  mcp-path3:
+    image: python:3.12-slim
+    container_name: bir-mcp-path3
+    depends_on:
+      oracle-init:
+        condition: service_completed_successfully
+    command:
+      - sh
+      - -c
+      - |
+        pip install --no-cache-dir --quiet uv
+        exec uvx --with "mcp<2" mcp-proxy --pass-environment --host 0.0.0.0 --port 8000 --stateless \
+          -- uvx --with "mcp<2" --from oracledb-mcp-server oracledb_mcp_server
+    environment:
+      DEBUG: "False"
+      DB_CONNECTION_STRING: "oracle+oracledb://bir_ro:${BIR_RO_PWD}@oracle:1521/?service_name=FREEPDB1"
+      COMMENT_DB_CONNECTION_STRING: "oracle+oracledb://bir:${BIR_PWD}@oracle:1521/?service_name=FREEPDB1"
+      QUERY_LIMIT_SIZE: "50"
+      TABLE_WHITE_LIST: "ACCOUNTS,CASHFLOW_FORECAST,CORRESPONDENTS,CURRENCIES,CUTOFF_TIMES,FUNDING_TRANSFERS,FX_RATES,INTRADAY_BALANCES,LIQUIDITY_ALERTS,PAYMENT_INSTRUCTIONS"
+      COLUMN_WHITE_LIST: "ACCOUNTS.ACCOUNT_ID,ACCOUNTS.ACCOUNT_NO,ACCOUNTS.ACCOUNT_TYPE,ACCOUNTS.CORR_ID,ACCOUNTS.CCY_CODE,ACCOUNTS.OPENING_LEDGER_BAL,ACCOUNTS.MIN_BALANCE,ACCOUNTS.TARGET_BUFFER,ACCOUNTS.INTRADAY_CREDIT_LIMIT,ACCOUNTS.IS_ACTIVE,CASHFLOW_FORECAST.FORECAST_ID,CASHFLOW_FORECAST.ACCOUNT_ID,CASHFLOW_FORECAST.BUCKET_START_TS,CASHFLOW_FORECAST.EXPECTED_IN,CASHFLOW_FORECAST.EXPECTED_OUT,CASHFLOW_FORECAST.CONFIDENCE_PCT,CORRESPONDENTS.CORR_ID,CORRESPONDENTS.BIC,CORRESPONDENTS.LEGAL_NAME,CORRESPONDENTS.COUNTRY_CODE,CORRESPONDENTS.TIER,CORRESPONDENTS.CREDIT_RATING,CORRESPONDENTS.RELATIONSHIP_SINCE,CORRESPONDENTS.IS_ACTIVE,CURRENCIES.CCY_CODE,CURRENCIES.CCY_NAME,CURRENCIES.MINOR_UNITS,CURRENCIES.RTGS_SYSTEM,CURRENCIES.TZ_NAME,CUTOFF_TIMES.CUTOFF_ID,CUTOFF_TIMES.ACCOUNT_ID,CUTOFF_TIMES.PAYMENT_TYPE,CUTOFF_TIMES.CUTOFF_LOCAL,CUTOFF_TIMES.WARNING_LEAD_MIN,FUNDING_TRANSFERS.TRANSFER_ID,FUNDING_TRANSFERS.FROM_ACCOUNT_ID,FUNDING_TRANSFERS.TO_ACCOUNT_ID,FUNDING_TRANSFERS.AMOUNT,FUNDING_TRANSFERS.CCY_CODE,FUNDING_TRANSFERS.INITIATED_TS,FUNDING_TRANSFERS.COMPLETED_TS,FUNDING_TRANSFERS.STATUS,FUNDING_TRANSFERS.PURPOSE,FUNDING_TRANSFERS.REQUESTED_BY,FX_RATES.BASE_CCY,FX_RATES.QUOTE_CCY,FX_RATES.RATE_DATE,FX_RATES.MID_RATE,INTRADAY_BALANCES.SNAPSHOT_ID,INTRADAY_BALANCES.ACCOUNT_ID,INTRADAY_BALANCES.BUSINESS_DATE,INTRADAY_BALANCES.SNAPSHOT_TS,INTRADAY_BALANCES.OPENING_BAL,INTRADAY_BALANCES.LEDGER_BAL,INTRADAY_BALANCES.PENDING_OUT,INTRADAY_BALANCES.PENDING_IN,INTRADAY_BALANCES.PROJECTED_EOD_BAL,INTRADAY_BALANCES.CREDIT_USED,LIQUIDITY_ALERTS.ALERT_ID,LIQUIDITY_ALERTS.ACCOUNT_ID,LIQUIDITY_ALERTS.RAISED_TS,LIQUIDITY_ALERTS.ALERT_TYPE,LIQUIDITY_ALERTS.SEVERITY,LIQUIDITY_ALERTS.MESSAGE,LIQUIDITY_ALERTS.STATUS,LIQUIDITY_ALERTS.CLEARED_TS,PAYMENT_INSTRUCTIONS.PAYMENT_ID,PAYMENT_INSTRUCTIONS.UETR,PAYMENT_INSTRUCTIONS.ACCOUNT_ID,PAYMENT_INSTRUCTIONS.DIRECTION,PAYMENT_INSTRUCTIONS.PAYMENT_TYPE,PAYMENT_INSTRUCTIONS.AMOUNT,PAYMENT_INSTRUCTIONS.CCY_CODE,PAYMENT_INSTRUCTIONS.VALUE_DATE,PAYMENT_INSTRUCTIONS.SUBMITTED_TS,PAYMENT_INSTRUCTIONS.SETTLED_TS,PAYMENT_INSTRUCTIONS.STATUS,PAYMENT_INSTRUCTIONS.PRIORITY,PAYMENT_INSTRUCTIONS.COUNTERPARTY_BIC,PAYMENT_INSTRUCTIONS.CLIENT_REF"
+    ports:
+      - "${PATH3_PORT:-9012}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 90s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # LiteLLM proxy / MCP gateway. No database: the MCP servers and models
+  # come from config.yaml, and the master key is the only credential. That
+  # rules out virtual keys, teams, budgets, spend logs and adding servers
+  # through the UI - none of which this PoC uses.
+  # ------------------------------------------------------------------
+  litellm:
+    # Stock image. uv and the MCP server package are installed at container
+    # start instead of being baked in - no build step, at the cost of ~20s of
+    # startup and registry egress on every start.
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: bir-litellm
+    depends_on:
+      mcp-path1:
+        condition: service_healthy
+      mcp-path3:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "[init] installing uv"
+        apk add --no-cache uv
+        echo "[init] installing oracledb-mcp-server (mcp<2: the package imports mcp.server.fastmcp)"
+        uv tool install --python 3.12 --with "mcp<2" oracledb-mcp-server==0.1.1
+        echo "[init] starting proxy"
+        exec docker/prod_entrypoint.sh --config /app/config.yaml --port 4000
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      # Where `uv tool install` puts things, and where `uvx --offline` looks
+      # for them when the proxy spawns the MCP server.
+      # Consumed by the MCP server the proxy spawns over stdio (path2);
+      # config.yaml refers to them as os.environ/BIR_RO_DSN and os.environ/BIR_DSN.
+      BIR_RO_DSN: oracle+oracledb://bir_ro:${BIR_RO_PWD}@oracle:1521/?service_name=FREEPDB1
+      BIR_DSN: oracle+oracledb://bir:${BIR_PWD}@oracle:1521/?service_name=FREEPDB1
+      UV_TOOL_DIR: /opt/uv/tools
+      UV_CACHE_DIR: /opt/uv/cache
+      UV_PYTHON_INSTALL_DIR: /opt/uv/python
+      # Optional upstream providers - left empty in this PoC.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      # Covers the install before the first probe counts against the container.
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  oracle-data:

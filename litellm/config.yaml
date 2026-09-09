@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------
+# LiteLLM proxy configuration - BIR PoC
+#
+# Two ways of reaching Oracle over MCP, both registered here:
+#
+#   path1  dmeppiel/oracle-mcp-server in its own container, fronted with
+#          streamable HTTP by mcp-proxy.
+#   path2  oracledb-mcp-server spawned by the proxy itself with uvx.
+#   path3  oracledb-mcp-server in its own container, also fronted by
+#          mcp-proxy.
+# ---------------------------------------------------------------------
+
+model_list:
+  # Enabled automatically once ANTHROPIC_API_KEY is present in .env.
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+mcp_servers:
+  # --- PATH 1: published image, own container, bridged to HTTP --------
+  path1:
+    url: http://mcp-path1:8000/mcp
+    transport: http
+    auth_type: none
+    description: >-
+      Oracle schema context and SQL for the BIR schema
+      (dmeppiel/oracle-mcp-server, its own container, bridged to HTTP).
+
+  # --- PATH 3: same package as path 2, own container, bridged ---------
+  path3:
+    url: http://mcp-path3:8000/mcp
+    transport: http
+    auth_type: none
+    description: >-
+      Oracle table/column context and SQL for the BIR schema
+      (oracledb-mcp-server behind mcp-proxy, its own container).
+
+  # --- PATH 2: spawned inside the proxy through uv --------------------
+  # uv, uvx and oracledb-mcp-server are baked into the image, so the spawn
+  # resolves offline. Table and column allow-lists are the server's own
+  # scoping mechanism - it only ever sees what is listed here.
+  path2:
+    transport: stdio
+    command: uvx
+    args: ["--offline", "--from", "oracledb-mcp-server", "oracledb_mcp_server"]
+    description: >-
+      Oracle table/column context and SQL execution for the BIR schema
+      (oracledb-mcp-server, run in-process by the proxy).
+    env:
+      # Two logins on purpose. The server reads table/column comments from
+      # USER_TAB_COMMENTS, which only shows objects the login owns, so the
+      # metadata connection is the schema owner. Every query the tools run
+      # goes through DB_CONNECTION_STRING, which is the SELECT-only user, so
+      # execute_sql (which has no read-only guard of its own) cannot write.
+      # LiteLLM hands this map to the subprocess as its whole environment, so
+      # the uv paths baked into the image have to be repeated here.
+      PATH: "/usr/local/bin:/usr/bin:/bin"
+      HOME: "/tmp"
+      UV_TOOL_DIR: "/opt/uv/tools"
+      UV_CACHE_DIR: "/opt/uv/cache"
+      UV_PYTHON_INSTALL_DIR: "/opt/uv/python"
+      DEBUG: "False"
+      DB_CONNECTION_STRING: os.environ/BIR_RO_DSN
+      COMMENT_DB_CONNECTION_STRING: os.environ/BIR_DSN
+      QUERY_LIMIT_SIZE: "50"
+      TABLE_WHITE_LIST: "ACCOUNTS,CASHFLOW_FORECAST,CORRESPONDENTS,CURRENCIES,CUTOFF_TIMES,FUNDING_TRANSFERS,FX_RATES,INTRADAY_BALANCES,LIQUIDITY_ALERTS,PAYMENT_INSTRUCTIONS"
+      COLUMN_WHITE_LIST: "ACCOUNTS.ACCOUNT_ID,ACCOUNTS.ACCOUNT_NO,ACCOUNTS.ACCOUNT_TYPE,ACCOUNTS.CORR_ID,ACCOUNTS.CCY_CODE,ACCOUNTS.OPENING_LEDGER_BAL,ACCOUNTS.MIN_BALANCE,ACCOUNTS.TARGET_BUFFER,ACCOUNTS.INTRADAY_CREDIT_LIMIT,ACCOUNTS.IS_ACTIVE,CASHFLOW_FORECAST.FORECAST_ID,CASHFLOW_FORECAST.ACCOUNT_ID,CASHFLOW_FORECAST.BUCKET_START_TS,CASHFLOW_FORECAST.EXPECTED_IN,CASHFLOW_FORECAST.EXPECTED_OUT,CASHFLOW_FORECAST.CONFIDENCE_PCT,CORRESPONDENTS.CORR_ID,CORRESPONDENTS.BIC,CORRESPONDENTS.LEGAL_NAME,CORRESPONDENTS.COUNTRY_CODE,CORRESPONDENTS.TIER,CORRESPONDENTS.CREDIT_RATING,CORRESPONDENTS.RELATIONSHIP_SINCE,CORRESPONDENTS.IS_ACTIVE,CURRENCIES.CCY_CODE,CURRENCIES.CCY_NAME,CURRENCIES.MINOR_UNITS,CURRENCIES.RTGS_SYSTEM,CURRENCIES.TZ_NAME,CUTOFF_TIMES.CUTOFF_ID,CUTOFF_TIMES.ACCOUNT_ID,CUTOFF_TIMES.PAYMENT_TYPE,CUTOFF_TIMES.CUTOFF_LOCAL,CUTOFF_TIMES.WARNING_LEAD_MIN,FUNDING_TRANSFERS.TRANSFER_ID,FUNDING_TRANSFERS.FROM_ACCOUNT_ID,FUNDING_TRANSFERS.TO_ACCOUNT_ID,FUNDING_TRANSFERS.AMOUNT,FUNDING_TRANSFERS.CCY_CODE,FUNDING_TRANSFERS.INITIATED_TS,FUNDING_TRANSFERS.COMPLETED_TS,FUNDING_TRANSFERS.STATUS,FUNDING_TRANSFERS.PURPOSE,FUNDING_TRANSFERS.REQUESTED_BY,FX_RATES.BASE_CCY,FX_RATES.QUOTE_CCY,FX_RATES.RATE_DATE,FX_RATES.MID_RATE,INTRADAY_BALANCES.SNAPSHOT_ID,INTRADAY_BALANCES.ACCOUNT_ID,INTRADAY_BALANCES.BUSINESS_DATE,INTRADAY_BALANCES.SNAPSHOT_TS,INTRADAY_BALANCES.OPENING_BAL,INTRADAY_BALANCES.LEDGER_BAL,INTRADAY_BALANCES.PENDING_OUT,INTRADAY_BALANCES.PENDING_IN,INTRADAY_BALANCES.PROJECTED_EOD_BAL,INTRADAY_BALANCES.CREDIT_USED,LIQUIDITY_ALERTS.ALERT_ID,LIQUIDITY_ALERTS.ACCOUNT_ID,LIQUIDITY_ALERTS.RAISED_TS,LIQUIDITY_ALERTS.ALERT_TYPE,LIQUIDITY_ALERTS.SEVERITY,LIQUIDITY_ALERTS.MESSAGE,LIQUIDITY_ALERTS.STATUS,LIQUIDITY_ALERTS.CLEARED_TS,PAYMENT_INSTRUCTIONS.PAYMENT_ID,PAYMENT_INSTRUCTIONS.UETR,PAYMENT_INSTRUCTIONS.ACCOUNT_ID,PAYMENT_INSTRUCTIONS.DIRECTION,PAYMENT_INSTRUCTIONS.PAYMENT_TYPE,PAYMENT_INSTRUCTIONS.AMOUNT,PAYMENT_INSTRUCTIONS.CCY_CODE,PAYMENT_INSTRUCTIONS.VALUE_DATE,PAYMENT_INSTRUCTIONS.SUBMITTED_TS,PAYMENT_INSTRUCTIONS.SETTLED_TS,PAYMENT_INSTRUCTIONS.STATUS,PAYMENT_INSTRUCTIONS.PRIORITY,PAYMENT_INSTRUCTIONS.COUNTERPARTY_BIC,PAYMENT_INSTRUCTIONS.CLIENT_REF"
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  request_timeout: 120
+  num_retries: 2
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
